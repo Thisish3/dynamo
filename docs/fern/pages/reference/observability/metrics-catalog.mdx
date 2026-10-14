@@ -268,35 +268,39 @@ independent of backend admission; see [Backend Admission Control](../../develope
   Time a queued request spends waiting for a TCP worker-pool permit after dispatcher pickup.
 </ParamField>
 
-The `dynamo_backend_admission_*` family below is emitted by the backend admission gate, which bounds the requests a worker process admits to its engine, across every transport, with an engine request limit and an engine wait limit. It is independent of the worker-pool metrics above and is always present; see [Backend Admission Control](../../developer-guide/knowledge-base/concepts/fault-tolerance/admission-control-architecture.md#backend). The limits come from configuration and are not exported.
+The `dynamo_backend_admission_*` family below is emitted by the backend admission gate, which bounds the requests a worker process's model backend admits to its engine, whatever transport delivered them, with an engine request limit and an engine request waiting limit per data-parallel (DP) rank. It is independent of the worker-pool metrics above, and every worker process with a participating backend, one whose backend request path admits through the gate, exposes it from before its first request; see [Backend Admission Control](../../developer-guide/knowledge-base/concepts/fault-tolerance/admission-control-architecture.md#backend). The limits come from configuration and are not exported.
+
+Every metric in the family carries a `dp_rank` label: the global DP rank the gate classified and accounted the request under, whatever its outcome, such as `dp_rank="4"`, or `dp_rank="unspecified"` for a request without a usable rank — none assigned, ranks not yet reported, or a rank the worker does not serve. Each contribution to a metric belongs to exactly one `dp_rank` series, so sum a metric over `dp_rank` for its worker total; there is no separate aggregate series. `unspecified` is exposed with the family, and each served rank once the worker reports its ranks.
 
 <ParamField path="dynamo_backend_admission_engine_request_count" type="gauge">
-  Requests admitted to the engine that have not finished, including requests that have already produced their first response. A request is counted from admission until its response stream ends, or until it fails, is cancelled, or is dropped.
+  Requests admitted to the engine that have not finished, including requests whose wait for the engine's output has already ended, by `dp_rank`. A request is counted from admission until its response stream ends, or until it fails, is cancelled, or is dropped.
 </ParamField>
 
-<ParamField path="dynamo_backend_admission_engine_wait_count" type="gauge">
-  Admitted requests still awaiting their first engine response. A request leaves this count when the gate observes the first item of the engine's response stream, while it stays in `dynamo_backend_admission_engine_request_count` until it finishes, so this count is always a subset of that one.
+<ParamField path="dynamo_backend_admission_engine_request_waiting_count" type="gauge">
+  Admitted requests still waiting for their engine's output, by `dp_rank`. A decode, aggregated, or encode request leaves this count at its first response carrying a generated token, and a prefill request at its completion response, which need not carry one; metadata and other interim responses leave it waiting, and a request whose stream ends first leaves it then. It stays in `dynamo_backend_admission_engine_request_count` until it finishes, so `engine_request_waiting_count <= engine_request_count`. Renamed from `dynamo_backend_admission_engine_wait_count`.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_request_queue_count" type="gauge">
-  Requests currently waiting in the gate queue. Queued requests count toward neither engine gauge. It excludes requests in a TCP request-plane queue and requests in the engine's own scheduler.
+  Requests currently waiting in a gate queue, by `dp_rank`. Queued requests count toward neither engine gauge, and a queued request removed by cancellation leaves the count at once. It excludes requests in a TCP request-plane queue and requests in the engine's own scheduler.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_request_receive_total" type="counter">
-  Cumulative requests received by the gate, counted once on entry whether they are later admitted, queued, rejected, or cancelled, including requests already cancelled on arrival. It has no admission-path label.
+  Cumulative requests received by the gate, by `dp_rank`, counted once on entry whether they are later admitted, queued, rejected, or cancelled, including requests already cancelled on arrival.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_request_admit_total" type="counter">
-  Cumulative requests the gate passed into the engine, counted once at that handoff and labelled `source`: `direct` was admitted without waiting in the gate queue, `queue` after waiting there. Joining the queue or being offered engine capacity is not an admission, and a later engine failure or cancellation does not undo one.
+  Cumulative requests the gate passed into the engine, by `dp_rank`, counted once at that handoff and labelled `source`: `direct` was admitted without waiting in a gate queue, `queue` after waiting there. Joining a queue or being offered engine capacity is not an admission, and a later engine failure or cancellation does not undo one.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_rejection_total" type="counter">
-  Cumulative requests the gate rejected because an engine limit was full and the queue had no space. It has no labels. A cancelled request is not a rejection.
+  Cumulative requests the gate rejected for capacity, by `dp_rank`: an engine limit was full and the request's queue had no space. It has no reason label. A cancelled request is not a rejection.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_cancellation_total" type="counter">
-  Cumulative requests cancelled before backend admission, whether already cancelled when the gate observed them or cancelled while queued. Cancellation is neither a rejection nor an overload.
+  Cumulative requests cancelled before engine handoff, by `dp_rank`, each counted once: already cancelled on arrival, cancelled while queued, found cancelled at its dequeue, or cancelled after being offered capacity it never took. Cancellation is neither a rejection nor an overload.
 </ParamField>
+
+Once no request is still queued or in handoff, each `dp_rank` series satisfies `request_receive_total = request_admit_total{source="direct"} + request_admit_total{source="queue"} + rejection_total + cancellation_total`, while engine streams may still be running. Separately scraped series are not an atomic snapshot, so the identity need not hold exactly on a live scrape with requests pending.
 
 Specialized components expose additional families under their own prefix, e.g. `dynamo_preprocessor_*` for preprocessor components.
 

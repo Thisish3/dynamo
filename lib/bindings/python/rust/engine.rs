@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Error, Result};
@@ -16,8 +16,11 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 
+use dynamo_llm::admission_gate::{self, AdmissionRequest, AdmissionResponse, WaitingRelease};
 use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
 use dynamo_runtime::logging::get_distributed_tracing_context;
+use dynamo_runtime::pipeline::network::RequestPlanePayloadCodec;
+use dynamo_runtime::telemetry::LifecycleOperationRole;
 pub use dynamo_runtime::{
     pipeline::{
         AsyncEngine, AsyncEngineContext, AsyncEngineContextProvider, Data, DataStream, ManyOut,
@@ -31,7 +34,10 @@ use dynamo_runtime::pipeline::ManyIn;
 
 use super::context::{Context, callable_accepts_kwarg};
 use super::errors::{http_like_error_to_dynamo, py_exception_to_backend_error};
-use crate::python_payload::{PythonPayload, PythonResponseItem};
+use crate::python_payload::{
+    EncodedPythonResponse, PythonPayload, PythonResponseItem, WaitClassification,
+    encode_python_item,
+};
 
 /// Add bindings from this crate to the provided module
 pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -193,32 +199,82 @@ impl PythonAsyncEngine {
 }
 
 impl PythonAsyncEngine {
-    pub(crate) fn network_engine(&self) -> PythonNetworkEngine {
-        PythonNetworkEngine(self.0.clone())
+    pub(crate) fn network_engine(&self, backend_role: BackendRole) -> PythonNetworkEngine {
+        PythonNetworkEngine {
+            engine: self.0.clone(),
+            backend_role,
+        }
     }
 }
 
-/// Network-only Python engine. Requests and responses stay as Python-owned
-/// objects so the ingress adapter can transcode them directly to and from the
-/// configured request-plane codec.
+/// The role a Python endpoint serves as a model backend, once it has one.
+///
+/// A Python endpoint can serve any handler; it is a model backend only once
+/// `register_model` records its role, which it does before it builds and
+/// publishes the model card. The cell is the endpoint's own, shared by every
+/// clone, so a role recorded after serving starts applies to the next request.
+/// Its network engines admit a request through the backend admission gate only
+/// while one is recorded: a generic endpoint never touches the gate. Each reads
+/// the role once per request, and admits the request and classifies its
+/// responses under that one reading, so a registration while it runs changes
+/// neither.
 #[derive(Clone)]
-pub(crate) struct PythonNetworkEngine(PythonServerStreamingEngine);
+pub(crate) struct BackendRole(Arc<OnceLock<LifecycleOperationRole>>);
+
+impl BackendRole {
+    pub(crate) fn of(endpoint: &dynamo_runtime::component::Endpoint) -> Self {
+        Self(endpoint.lifecycle_operation_role())
+    }
+
+    /// Which response ends an admitted request's wait, or `None` while the
+    /// endpoint is not a model backend.
+    pub(crate) fn waiting_release(&self) -> Option<WaitingRelease> {
+        self.0.get().copied().and_then(WaitingRelease::for_role)
+    }
+}
+
+/// Network-only Python engine. Requests stay Python-owned objects, transcoded
+/// directly from the request-plane codec, and each response is encoded
+/// straight into the request's own codec as it leaves the handler.
+#[derive(Clone)]
+pub(crate) struct PythonNetworkEngine {
+    engine: PythonServerStreamingEngine,
+    backend_role: BackendRole,
+}
 
 #[async_trait::async_trait]
-impl AsyncEngine<SingleIn<PythonPayload>, ManyOut<PythonResponseItem>, Error>
+impl AsyncEngine<SingleIn<PythonPayload>, ManyOut<EncodedPythonResponse>, Error>
     for PythonNetworkEngine
 {
+    /// A model backend's request is admitted through the backend admission
+    /// gate before its handler is invoked; any other endpoint's request goes
+    /// straight to its handler.
     async fn generate(
         &self,
         request: SingleIn<PythonPayload>,
-    ) -> Result<ManyOut<PythonResponseItem>, Error> {
-        generate_python_stream(
-            &self.0,
+    ) -> Result<ManyOut<EncodedPythonResponse>, Error> {
+        let payload_codec = request.payload_codec();
+        let context = request.context();
+        let dp_rank = request.dp_rank();
+        let release = self.backend_role.waiting_release();
+        let generate = generate_python_stream(
+            &self.engine,
             request,
             |_py, request| Ok(request.into_inner()),
-            unbuffered_python_response_stream,
-        )
-        .await
+            move |stream, ctx, request_id| {
+                encoded_python_response_stream(
+                    stream,
+                    ctx,
+                    request_id,
+                    payload_codec,
+                    WaitClassification::new(release),
+                )
+            },
+        );
+        match release {
+            Some(release) => admission_gate::admit(&context, dp_rank, release, generate).await,
+            None => generate.await,
+        }
     }
 }
 
@@ -541,6 +597,34 @@ where
     Box::pin(ReceiverStream::new(spawn_response_forwarder::<Resp>(
         stream, ctx, request_id,
     )))
+}
+
+/// [`unbuffered_python_response_stream`], with each item encoded into the
+/// request-plane `payload_codec` before the stream yields it — the same parse
+/// and encoding the ingress would otherwise run on the raw item, in the same
+/// blocking step — and classified for backend admission while `classification`
+/// says the gate still reads it. The gate consumes this stream directly, so an
+/// item it yields is accepted in stream order. The generator is still polled
+/// only when the consumer asks for the next item, and only once the current
+/// one is fully encoded, so no Python object outlives its turn.
+fn encoded_python_response_stream(
+    stream: PyItemStream,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+    payload_codec: RequestPlanePayloadCodec,
+    classification: WaitClassification,
+) -> DataStream<EncodedPythonResponse> {
+    let items = unbuffered_python_response_stream(stream, ctx, request_id);
+    Box::pin(futures::stream::unfold(
+        (items, classification),
+        move |(mut items, classification)| async move {
+            let item = items.next().await?;
+            let response =
+                encode_python_item(payload_codec, item, classification.classifies()).await;
+            classification.accepted(response.admission_output());
+            Some((response, (items, classification)))
+        },
+    ))
 }
 
 fn unbuffered_python_response_stream(
