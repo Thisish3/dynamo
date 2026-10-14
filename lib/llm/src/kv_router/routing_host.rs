@@ -857,6 +857,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .await?;
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
+            if let Some(trace) = selection.selection_trace.take() {
+                crate::request_trace::emit_router_selection(
+                    request.context().id(),
+                    self.kv_router().worker_type(),
+                    trace,
+                );
+            }
             if let Some(ref tracker) = request.tracker {
                 let isl_blocks = routing_parts
                     .token_ids

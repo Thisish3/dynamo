@@ -37,14 +37,14 @@ pub(crate) use integration::{
     build_request_end_trace_state, finish_reason_metadata_handle, wrap_chat_request_end_stream,
     wrap_completion_request_end_stream,
 };
-pub(crate) use record::{publish_tool_record, validate_tool_record};
+pub(crate) use record::{emit_router_selection, publish_tool_record, validate_tool_record};
 pub(crate) use replay::replay_metrics;
 pub use sink::{ActiveInput, TraceShutdownReport, shutdown_workers};
 pub use types::{
     ChoiceFinishReasonMetadata, FinishReasonMetadata, RequestReplayMetrics,
     RequestTraceEventSource, RequestTraceEventType, RequestTraceMetrics, RequestTracePayload,
-    RequestTraceRecord, RequestTraceSchema, RequestTraceToolEvent, RequestTraceToolEventIngress,
-    RequestTraceToolStatus, RequestTraceWorkerInfo, ToolCallMetadata,
+    RequestTraceRecord, RequestTraceRouterSelection, RequestTraceSchema, RequestTraceToolEvent,
+    RequestTraceToolEventIngress, RequestTraceToolStatus, RequestTraceWorkerInfo, ToolCallMetadata,
 };
 
 static BUS: TelemetryBus<RequestTraceRecord> = TelemetryBus::new();
@@ -104,6 +104,20 @@ pub(crate) async fn start_tool_event_ingest_from_policy(
 
 pub fn publish(record: RequestTraceRecord) {
     BUS.publish(record);
+}
+
+/// The router-selection sampler for an embedded router, or `None` when
+/// `router_selection` records are not enabled. Resolved once at router
+/// construction so the per-request cost of the disabled path is one branch.
+pub fn router_selection_sampler()
+-> Option<std::sync::Arc<dynamo_kv_router::scheduling::SelectionTraceSampler>> {
+    let policy = policy();
+    (policy.enabled && policy.emit_router_selection_records()).then(|| {
+        std::sync::Arc::new(dynamo_kv_router::scheduling::SelectionTraceSampler::new(
+            policy.router_selection_top_k,
+            policy.router_selection_sample_every,
+        ))
+    })
 }
 
 pub fn subscribe() -> tokio::sync::broadcast::Receiver<RequestTraceRecord> {

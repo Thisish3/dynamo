@@ -101,6 +101,7 @@ where
             kv_transfer_candidates,
             retain_kv_transfer_chain,
             shared_cache_hits,
+            selection_trace,
         } = request;
         let request = SchedulingRequest {
             mode,
@@ -122,6 +123,7 @@ where
             kv_transfer_candidates,
             retain_kv_transfer_chain,
             shared_cache_hits,
+            selection_trace,
             worker_loads: FxHashMap::default(),
             resp_tx,
         };
@@ -586,6 +588,7 @@ where
             pinned_worker,
             allowed_worker_ids,
             shared_cache_hits,
+            selection_trace: None,
         })
         .await
     }
@@ -1144,6 +1147,7 @@ mod tests {
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
             shared_cache_hits: None,
+            selection_trace: None,
         }
     }
 

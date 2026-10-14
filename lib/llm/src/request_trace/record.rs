@@ -13,9 +13,11 @@ use crate::request_trace::RequestTracePayload;
 use super::RequestTraceEventType;
 use super::RequestTraceMetrics;
 use super::RequestTraceRecord;
+use super::RequestTraceRouterSelection;
 use super::RequestTraceSchema;
 use super::RequestTraceWorkerInfo;
 use super::publish;
+use dynamo_kv_router::protocols::SelectionTrace;
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -100,6 +102,7 @@ pub(crate) fn emit_request_end(
         agent_context: None,
         request: Some(request),
         tool: None,
+        selection: None,
         payload: None,
     });
 }
@@ -117,6 +120,7 @@ pub(crate) fn emit_agent_request_end(
         agent_context: Some(agent_context),
         request: Some(request),
         tool: None,
+        selection: None,
         payload: None,
     });
 }
@@ -130,7 +134,51 @@ pub(crate) fn emit_request_payload(payload: RequestTracePayload, event_time_unix
         agent_context: None,
         request: None,
         tool: None,
+        selection: None,
         payload: Some(payload),
+    });
+}
+
+/// Publish one `router_selection` row. Runs on the routing task, never on the
+/// scheduler actor; column building is O(retained rows).
+pub(crate) fn emit_router_selection(
+    request_id: &str,
+    worker_type: &'static str,
+    trace: Box<SelectionTrace>,
+) {
+    let SelectionTrace {
+        candidate_count,
+        pinned,
+        rows,
+    } = *trace;
+    let mut worker_id = Vec::with_capacity(rows.len());
+    let mut dp_rank = Vec::with_capacity(rows.len());
+    let mut cost = Vec::with_capacity(rows.len());
+    for row in rows {
+        worker_id.push(row.worker.worker_id);
+        dp_rank.push(row.worker.dp_rank);
+        // Shorter JSON than the full shortest-roundtrip repr; 1e-6 block is far below
+        // any cost difference the picker acts on.
+        cost.push((row.cost * 1e6).round() / 1e6);
+    }
+    publish(RequestTraceRecord {
+        schema: RequestTraceSchema::V1,
+        event_type: RequestTraceEventType::RouterSelection,
+        event_time_unix_ms: unix_time_ms(),
+        event_source: Some(RequestTraceEventSource::Dynamo),
+        agent_context: None,
+        request: None,
+        tool: None,
+        payload: None,
+        selection: Some(RequestTraceRouterSelection {
+            request_id: request_id.to_string(),
+            worker_type: worker_type.to_string(),
+            pinned,
+            candidate_count: candidate_count as u64,
+            worker_id,
+            dp_rank,
+            cost,
+        }),
     });
 }
 
@@ -272,6 +320,7 @@ mod tests {
                 error_type: None,
             }),
             payload: None,
+            selection: None,
         };
 
         let err = validate_tool_record(&record).expect_err("NaN duration should fail validation");

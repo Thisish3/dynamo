@@ -466,6 +466,8 @@ pub enum FindBestMatchOutcome {
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
+        /// Per-candidate costs, present only when request tracing sampled this selection.
+        selection_trace: Option<Box<dynamo_kv_router::protocols::SelectionTrace>>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -1529,6 +1531,7 @@ impl KvRouter {
                 potential_decode_blocks: response.potential_decode_blocks as u64,
                 routing_hashes,
                 kv_hint,
+                selection_trace: response.selection_trace,
             },
             booking,
             advisory_load,

@@ -26,6 +26,8 @@ pub struct RequestTraceRecord {
     pub tool: Option<RequestTraceToolEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<RequestTracePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<RequestTraceRouterSelection>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub enum RequestTraceEventType {
     ToolError,
     #[serde(rename = "request_payload")]
     RequestPayload,
+    #[serde(rename = "router_selection")]
+    RouterSelection,
 }
 
 impl RequestTraceEventType {
@@ -69,6 +73,24 @@ pub struct RequestTracePayload {
     pub payload_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_drop_reason: Option<String>,
+}
+
+/// Per-candidate costs for one router worker selection, emitted when the
+/// scheduler chose a worker. Columns are index-aligned and sorted by ascending
+/// cost. `candidate_count` is the number of eligible workers scored before
+/// top-k truncation; the dispatched worker is always among the rows and is
+/// identified by the matching `request_end` row's worker id. Costs are in the
+/// policy's units (scheduler-tracked KV blocks for the builtin policy), rounded
+/// to 1e-6.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestTraceRouterSelection {
+    pub request_id: String,
+    pub worker_type: String,
+    pub pinned: bool,
+    pub candidate_count: u64,
+    pub worker_id: Vec<u64>,
+    pub dp_rank: Vec<u32>,
+    pub cost: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +310,7 @@ impl From<RequestTraceToolEventIngress> for RequestTraceRecord {
             request: None,
             tool: Some(ingress.tool),
             payload: None,
+            selection: None,
         }
     }
 }
@@ -341,6 +364,7 @@ mod tests {
                 finish_reason_metadata: None,
             }),
             tool: None,
+            selection: None,
             payload: None,
         };
 
@@ -383,6 +407,7 @@ mod tests {
             agent_context: None,
             request: None,
             tool: None,
+            selection: None,
             payload: Some(RequestTracePayload {
                 request_id: "req-1".to_string(),
                 endpoint: "openai.chat_completion".to_string(),
@@ -423,6 +448,7 @@ mod tests {
             agent_context: None,
             request: None,
             tool: None,
+            selection: None,
             payload: Some(RequestTracePayload {
                 request_id: "req-h".to_string(),
                 endpoint: "openai.chat_completion".to_string(),
@@ -458,6 +484,46 @@ mod tests {
         }
         let value = serde_json::to_value(&bare).unwrap();
         assert!(value["payload"].get("http_request_headers").is_none());
+    }
+
+    #[test]
+    fn router_selection_record_serializes_columns() {
+        let record = RequestTraceRecord {
+            schema: RequestTraceSchema::V1,
+            event_type: RequestTraceEventType::RouterSelection,
+            event_time_unix_ms: 1_100,
+            event_source: Some(RequestTraceEventSource::Dynamo),
+            agent_context: None,
+            request: None,
+            tool: None,
+            payload: None,
+            selection: Some(RequestTraceRouterSelection {
+                request_id: "req-1".to_string(),
+                worker_type: "decode".to_string(),
+                pinned: false,
+                candidate_count: 40,
+                worker_id: vec![7, 9, 3],
+                dp_rank: vec![0, 1, 0],
+                cost: vec![1.5, 1.5, 2.25],
+            }),
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event_type"], "router_selection");
+        assert!(value.get("request").is_none());
+        assert_eq!(value["selection"]["request_id"], "req-1");
+        assert_eq!(value["selection"]["candidate_count"], 40);
+        assert_eq!(
+            value["selection"]["worker_id"],
+            serde_json::json!([7, 9, 3])
+        );
+        assert_eq!(
+            value["selection"]["cost"],
+            serde_json::json!([1.5, 1.5, 2.25])
+        );
+
+        let roundtrip: RequestTraceRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip.selection, record.selection);
     }
 
     #[test]

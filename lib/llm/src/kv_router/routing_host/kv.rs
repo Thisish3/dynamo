@@ -500,6 +500,13 @@ impl RoutingHost {
                 }
             }
 
+            if let Some(trace) = selection.selection_trace.take() {
+                crate::request_trace::emit_router_selection(
+                    &context_id,
+                    chooser.worker_type(),
+                    trace,
+                );
+            }
             if let Some(ref tracker) = request.tracker {
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);

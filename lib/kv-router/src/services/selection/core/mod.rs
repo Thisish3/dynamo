@@ -34,8 +34,9 @@ use crate::scheduling::selector::WorkerSelectionPolicy;
 use crate::scheduling::{
     KvSchedulerError, LocalScheduler, LoraWorkerFilter, OverlapAnalysis, OverlapSignals,
     OverloadedWorkerProvider, PotentialLoad, PrefillLoadEstimator, ScheduleMode, ScheduleRequest,
-    SessionContext, TieredOverlapRefresher, WorkerAvailabilityProvider, effective_prefill_tokens,
-    narrow_allowed_worker_ids_by_lora, prefill_load_hint_from_effective_tokens,
+    SelectionTraceSampler, SessionContext, TieredOverlapRefresher, WorkerAvailabilityProvider,
+    effective_prefill_tokens, narrow_allowed_worker_ids_by_lora,
+    prefill_load_hint_from_effective_tokens,
 };
 use crate::sequences::{
     ActiveSequencesMultiWorker, LifecycleMutationOutcome, ReplicaRequestLeaseObserver,
@@ -221,6 +222,9 @@ pub struct HostTelemetry {
     /// Receives each partition's scheduler-owned load snapshots (active decode
     /// blocks and prefill tokens per worker) for metrics and overload detection.
     pub scheduler_load: Option<Arc<dyn SchedulerLoadSink>>,
+    /// Decides which admitted selections capture per-candidate costs on their
+    /// scheduling response. `None` captures nothing and costs one branch.
+    pub selection_trace: Option<Arc<SelectionTraceSampler>>,
 }
 
 /// Replica-sync transport the host carries for partitions this core does not

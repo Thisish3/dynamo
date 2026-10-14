@@ -42,6 +42,8 @@ pub(super) struct WorkerSelection {
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) kv_hint: Option<KvHint>,
     pub(super) request_lifecycle: Option<Box<RequestLifecycle>>,
+    /// Taken by the first publisher on the route; `None` once emitted or when not sampled.
+    pub(super) selection_trace: Option<Box<dynamo_kv_router::protocols::SelectionTrace>>,
 }
 
 // Transient return value; `Routed` is moved into `WorkerSelection` right away.
@@ -141,6 +143,7 @@ impl RoutingHost {
                 potential_decode_blocks,
                 routing_hashes,
                 kv_hint,
+                selection_trace,
             } => Ok(SelectionOutcome::Routed(WorkerSelection {
                 worker,
                 booking: admitted.booking,
@@ -154,6 +157,7 @@ impl RoutingHost {
                 routing_hashes,
                 kv_hint,
                 request_lifecycle: None,
+                selection_trace,
             })),
             FindBestMatchOutcome::QueueRejected { rejection } => {
                 Ok(SelectionOutcome::QueueRejected(rejection))

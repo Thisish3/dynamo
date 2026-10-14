@@ -15,8 +15,8 @@ use super::prefill_load::effective_prefill_tokens;
 use crate::kv_hints::KvTransferCandidates;
 pub use crate::protocols::PotentialLoad;
 use crate::protocols::{
-    LocalBlockHash, RoutingConstraints, SharedCacheHits, WorkerAffinityTarget, WorkerConfigLike,
-    WorkerId, WorkerWithDpRank,
+    LocalBlockHash, RoutingConstraints, SelectionTrace, SelectionTraceSpec, SharedCacheHits,
+    WorkerAffinityTarget, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use crate::scheduling::policy_queue::QueueRejection;
 use crate::sequences::WorkerLoadProjection;
@@ -161,6 +161,9 @@ pub struct SchedulingResponse {
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub potential_decode_blocks: usize,
+    /// Per-candidate costs, present only when the request carried a
+    /// [`SelectionTraceSpec`].
+    pub selection_trace: Option<Box<SelectionTrace>>,
 }
 
 /// Internal result that pairs a public scheduling response with its attempt identity.
@@ -211,6 +214,41 @@ impl NonMaxOverlapSelection {
     /// Return the effective overlap blocks sacrificed by the final selection.
     pub fn overlap_blocks_lost(self) -> f64 {
         self.highest_overlap_blocks - self.selected_overlap_blocks
+    }
+}
+
+/// Host-owned decision of which selections capture per-candidate costs.
+///
+/// `sample_every = N` traces one selection in every `N` admitted through this
+/// sampler; `0` and `1` trace every selection.
+#[derive(Debug)]
+pub struct SelectionTraceSampler {
+    spec: SelectionTraceSpec,
+    sample_every: u64,
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl SelectionTraceSampler {
+    pub fn new(top_k: usize, sample_every: u64) -> Self {
+        Self {
+            spec: SelectionTraceSpec { top_k },
+            sample_every,
+            counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The spec for this selection, or `None` when it falls outside the sample.
+    #[inline]
+    pub fn sample(&self) -> Option<SelectionTraceSpec> {
+        if self.sample_every <= 1 {
+            return Some(self.spec);
+        }
+        let ordinal = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ordinal
+            .is_multiple_of(self.sample_every)
+            .then_some(self.spec)
     }
 }
 
@@ -417,6 +455,9 @@ pub struct ScheduleRequest {
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
     pub shared_cache_hits: Option<SharedCacheHits>,
+    /// Capture per-candidate costs for this selection. `None` costs the
+    /// selector one branch; `Some` costs one row copy per retained candidate.
+    pub selection_trace: Option<SelectionTraceSpec>,
 }
 
 /// Actor-owned admission request.
@@ -451,6 +492,8 @@ pub struct SchedulingRequest {
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
     pub shared_cache_hits: Option<SharedCacheHits>,
+    /// See [`ScheduleRequest::selection_trace`].
+    pub selection_trace: Option<SelectionTraceSpec>,
 
     // Load state computed during admission.
     pub worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
@@ -649,6 +692,7 @@ mod tests {
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
             shared_cache_hits: None,
+            selection_trace: None,
             worker_loads,
             resp_tx: None,
         }
